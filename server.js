@@ -45,6 +45,7 @@ async function migrate() {
   // Add the new multi-image column if it doesn't exist yet (safe on repeated runs).
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]';`);
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS admin_edited BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS images_version INTEGER NOT NULL DEFAULT 1;`);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
@@ -84,7 +85,7 @@ async function backfillImages() {
         // Fallback: keep whatever single photo it already had.
         images = row.image ? [row.image] : [];
       }
-      await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+      await client.query("UPDATE products SET images=$1, images_version = images_version + 1 WHERE id=$2", [JSON.stringify(images), row.id]);
     }
     await client.query("COMMIT");
     console.log("Fotos actualizadas.");
@@ -144,7 +145,7 @@ async function upgradeImageQualityOnce() {
     for (const row of current) {
       const images = byId[row.id];
       if (images && images.length) {
-        await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+        await client.query("UPDATE products SET images=$1, images_version = images_version + 1 WHERE id=$2", [JSON.stringify(images), row.id]);
       }
     }
     await client.query("INSERT INTO meta (key, value) VALUES ('images_quality_v2', 'done')");
@@ -158,7 +159,17 @@ async function upgradeImageQualityOnce() {
   }
 }
 
-// One-time: put the model photo first in the carousel for original products
+// One-time: bump every product's image version so browsers that already
+// cached the old photo at a given /api/image/id/idx URL are forced to fetch
+// again. This fixes the reorder (and any earlier edit) actually showing up.
+async function bumpAllImageVersionsOnce() {
+  const { rows } = await pool.query("SELECT value FROM meta WHERE key='images_version_bump_v1'");
+  if (rows.length) return;
+  console.log("Invalidando caché de fotos en el navegador (nueva versión para todas)...");
+  await pool.query("UPDATE products SET images_version = images_version + 1");
+  await pool.query("INSERT INTO meta (key, value) VALUES ('images_version_bump_v1', 'done')");
+  console.log("Versión de fotos actualizada.");
+}
 // that were never edited by hand (detected automatically via face detection
 // over the source PowerPoint photos). Products the admin has edited are
 // skipped, same as the quality upgrade above.
@@ -178,7 +189,7 @@ async function reorderModelPhotoFirstOnce() {
     for (const row of current) {
       const images = byId[row.id];
       if (images && images.length) {
-        await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+        await client.query("UPDATE products SET images=$1, images_version = images_version + 1 WHERE id=$2", [JSON.stringify(images), row.id]);
       }
     }
     await client.query("INSERT INTO meta (key, value) VALUES ('images_order_v1', 'done')");
@@ -235,6 +246,7 @@ async function rebuildCatalogCache() {
           // render immediately instead of waiting for every photo of every
           // product to download in one giant JSON response.
           imageCount: images.length,
+          imageVersion: p.images_version || 1,
         };
       }),
   }));
@@ -375,7 +387,7 @@ app.patch("/api/admin/products/:id", requireAdmin, async (req, res) => {
     const { sectionId, name, price, dims, notes, images } = req.body || {};
     if (!sectionId || !name || !name.trim()) return res.status(400).json({ error: "Faltan datos del producto." });
     await pool.query(
-      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6, admin_edited=true WHERE id=$7`,
+      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6, admin_edited=true, images_version = images_version + 1 WHERE id=$7`,
       [sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), req.params.id]
     );
     catalogCache = null;
@@ -409,6 +421,7 @@ async function start() {
     await backfillImages();
     await upgradeImageQualityOnce();
     await reorderModelPhotoFirstOnce();
+    await bumpAllImageVersionsOnce();
     await rebuildCatalogCache();
   } catch (e) {
     console.error("Error de inicialización de base de datos:", e);

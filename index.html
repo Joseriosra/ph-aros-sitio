@@ -446,7 +446,7 @@ function renderCatalog(){
       const imageCount = p.imageCount || 0;
       const idxRange = Array.from({length: imageCount}, (_, i) => i);
       const slides = idxRange.length
-        ? idxRange.map(i=>`<img src="/api/image/${p.id}/${i}" alt="${escapeHtml(p.name)}" loading="lazy" class="carousel-slide" data-idx="${i}" style="display:${i===0?"block":"none"};">`).join("")
+        ? idxRange.map(i=>`<img src="/api/image/${p.id}/${i}?v=${p.imageVersion||1}" alt="${escapeHtml(p.name)}" loading="lazy" class="carousel-slide" data-idx="${i}" style="display:${i===0?"block":"none"};">`).join("")
         : `<div class="thumb empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">Sin foto</div>`;
       const dots = idxRange.length > 1
         ? `<div class="carousel-dots">${idxRange.map(i=>`<span class="dot ${i===0?"active":""}" data-idx="${i}"></span>`).join("")}</div>`
@@ -559,7 +559,7 @@ function renderProductsTable(){
     sec.products.forEach(p => {
       rows.push(`
         <tr>
-          <td>${p.imageCount ? `<img src="/api/image/${p.id}/0">` : ""}</td>
+          <td>${p.imageCount ? `<img src="/api/image/${p.id}/0?v=${p.imageVersion||1}">` : ""}</td>
           <td>${escapeHtml(p.name)}<div class="section-tag">${escapeHtml(sec.name)}</div></td>
           <td>${escapeHtml(p.price||"")}</td>
           <td class="row-actions">
