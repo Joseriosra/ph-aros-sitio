@@ -411,6 +411,10 @@ app.delete("/api/admin/products/:id", requireAdmin, async (req, res) => {
 
 // ---------- static frontend ----------
 app.get("/", (req, res) => {
+  // Always revalidate the HTML shell itself so a future deploy shows up
+  // immediately, without needing a hard refresh — the photos underneath
+  // still cache normally via their own versioned URLs.
+  res.set("Cache-Control", "no-cache");
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
