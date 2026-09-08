@@ -158,6 +158,40 @@ async function upgradeImageQualityOnce() {
   }
 }
 
+// One-time: put the model photo first in the carousel for original products
+// that were never edited by hand (detected automatically via face detection
+// over the source PowerPoint photos). Products the admin has edited are
+// skipped, same as the quality upgrade above.
+async function reorderModelPhotoFirstOnce() {
+  const { rows } = await pool.query("SELECT value FROM meta WHERE key='images_order_v1'");
+  if (rows.length) return; // already applied
+  console.log("Ordenando fotos (modelo primero) en los productos originales no editados...");
+  const seedPath = path.join(__dirname, "seed-data.json");
+  const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
+  const byId = {};
+  seed.forEach(sec => sec.products.forEach(p => { byId[p.id] = p.images || []; }));
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: current } = await client.query("SELECT id FROM products WHERE admin_edited = false");
+    for (const row of current) {
+      const images = byId[row.id];
+      if (images && images.length) {
+        await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+      }
+    }
+    await client.query("INSERT INTO meta (key, value) VALUES ('images_order_v1', 'done')");
+    await client.query("COMMIT");
+    console.log("Orden de fotos aplicado.");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Error ordenando fotos:", e);
+  } finally {
+    client.release();
+  }
+}
+
 function requireAdmin(req, res, next) {
   const passcode = req.header("x-admin-passcode");
   if (passcode !== ADMIN_PASSCODE) {
@@ -374,6 +408,7 @@ async function start() {
     await seedIfEmpty();
     await backfillImages();
     await upgradeImageQualityOnce();
+    await reorderModelPhotoFirstOnce();
     await rebuildCatalogCache();
   } catch (e) {
     console.error("Error de inicialización de base de datos:", e);
