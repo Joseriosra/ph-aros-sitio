@@ -1,9 +1,11 @@
 const express = require("express");
+const compression = require("compression");
 const fs = require("fs");
 const path = require("path");
 const { Pool } = require("pg");
 
 const app = express();
+app.use(compression());
 app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 3000;
@@ -132,26 +134,38 @@ function uid(prefix) {
 }
 
 // ---------- public API ----------
+// In-memory cache of the assembled catalog JSON string. Rebuilt only when an
+// admin write happens, so a burst of visitors doesn't repeatedly re-query and
+// re-serialize ~2MB of product photos on every page load (this was very
+// likely the cause of the free instance's 512MB memory-limit restarts).
+let catalogCache = null;
+
+async function rebuildCatalogCache() {
+  const secRes = await pool.query("SELECT * FROM sections ORDER BY position ASC");
+  const prodRes = await pool.query("SELECT * FROM products ORDER BY position ASC");
+  const sections = secRes.rows.map(s => ({
+    id: s.id,
+    name: s.name,
+    material: s.material,
+    products: prodRes.rows
+      .filter(p => p.section_id === s.id)
+      .map(p => ({
+        id: p.id,
+        name: p.name,
+        price: p.price,
+        dims: p.dims,
+        notes: p.notes,
+        images: (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []),
+      })),
+  }));
+  catalogCache = JSON.stringify({ sections });
+  return catalogCache;
+}
+
 app.get("/api/catalog", async (req, res) => {
   try {
-    const secRes = await pool.query("SELECT * FROM sections ORDER BY position ASC");
-    const prodRes = await pool.query("SELECT * FROM products ORDER BY position ASC");
-    const sections = secRes.rows.map(s => ({
-      id: s.id,
-      name: s.name,
-      material: s.material,
-      products: prodRes.rows
-        .filter(p => p.section_id === s.id)
-        .map(p => ({
-          id: p.id,
-          name: p.name,
-          price: p.price,
-          dims: p.dims,
-          notes: p.notes,
-          images: (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []),
-        })),
-    }));
-    res.json({ sections });
+    const body = catalogCache || await rebuildCatalogCache();
+    res.type("application/json").send(body);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "No se pudo cargar el catálogo." });
@@ -171,6 +185,7 @@ app.post("/api/admin/sections", requireAdmin, async (req, res) => {
     const id = uid("sec");
     const { rows } = await pool.query("SELECT COALESCE(MAX(position),-1)+1 AS pos FROM sections");
     await pool.query("INSERT INTO sections (id, name, material, position) VALUES ($1,$2,$3,$4)", [id, name.trim(), null, rows[0].pos]);
+    catalogCache = null;
     res.json({ ok: true, id });
   } catch (e) {
     console.error(e);
@@ -183,6 +198,7 @@ app.patch("/api/admin/sections/:id", requireAdmin, async (req, res) => {
     const { name } = req.body || {};
     if (!name || !name.trim()) return res.status(400).json({ error: "Falta el nombre." });
     await pool.query("UPDATE sections SET name=$1 WHERE id=$2", [name.trim(), req.params.id]);
+    catalogCache = null;
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -193,6 +209,7 @@ app.patch("/api/admin/sections/:id", requireAdmin, async (req, res) => {
 app.delete("/api/admin/sections/:id", requireAdmin, async (req, res) => {
   try {
     await pool.query("DELETE FROM sections WHERE id=$1", [req.params.id]);
+    catalogCache = null;
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -212,6 +229,7 @@ app.post("/api/admin/products", requireAdmin, async (req, res) => {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
       [id, sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), rows[0].pos]
     );
+    catalogCache = null;
     res.json({ ok: true, id });
   } catch (e) {
     console.error(e);
@@ -227,6 +245,7 @@ app.patch("/api/admin/products/:id", requireAdmin, async (req, res) => {
       `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6 WHERE id=$7`,
       [sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), req.params.id]
     );
+    catalogCache = null;
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -237,6 +256,7 @@ app.patch("/api/admin/products/:id", requireAdmin, async (req, res) => {
 app.delete("/api/admin/products/:id", requireAdmin, async (req, res) => {
   try {
     await pool.query("DELETE FROM products WHERE id=$1", [req.params.id]);
+    catalogCache = null;
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -254,6 +274,7 @@ async function start() {
     await migrate();
     await seedIfEmpty();
     await backfillImages();
+    await rebuildCatalogCache();
   } catch (e) {
     console.error("Error de inicialización de base de datos:", e);
   }
