@@ -443,19 +443,20 @@ function renderCatalog(){
       const dims = (p.dims||[]).map(d=>`<div>${escapeHtml(d)}</div>`).join("");
       const notes = (p.notes||[]).map(n=>`<div style="font-style:italic;">${escapeHtml(n)}</div>`).join("");
       const askText = `Hola! Me interesa "${p.name}"${p.price ? " ("+p.price+")" : ""}. ¿Está disponible?`;
-      const images = p.images && p.images.length ? p.images : [];
-      const slides = images.length
-        ? images.map((src,i)=>`<img src="${src}" alt="${escapeHtml(p.name)}" loading="lazy" class="carousel-slide" data-idx="${i}" style="display:${i===0?"block":"none"};">`).join("")
+      const imageCount = p.imageCount || 0;
+      const idxRange = Array.from({length: imageCount}, (_, i) => i);
+      const slides = idxRange.length
+        ? idxRange.map(i=>`<img src="/api/image/${p.id}/${i}" alt="${escapeHtml(p.name)}" loading="lazy" class="carousel-slide" data-idx="${i}" style="display:${i===0?"block":"none"};">`).join("")
         : `<div class="thumb empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">Sin foto</div>`;
-      const dots = images.length > 1
-        ? `<div class="carousel-dots">${images.map((_,i)=>`<span class="dot ${i===0?"active":""}" data-idx="${i}"></span>`).join("")}</div>`
+      const dots = idxRange.length > 1
+        ? `<div class="carousel-dots">${idxRange.map(i=>`<span class="dot ${i===0?"active":""}" data-idx="${i}"></span>`).join("")}</div>`
         : "";
-      const arrows = images.length > 1
+      const arrows = idxRange.length > 1
         ? `<button type="button" class="carousel-arrow prev" aria-label="Anterior">‹</button><button type="button" class="carousel-arrow next" aria-label="Siguiente">›</button>`
         : "";
       return `
         <div class="card">
-          <div class="thumb carousel" data-index="0" data-count="${images.length}">
+          <div class="thumb carousel" data-index="0" data-count="${idxRange.length}">
             ${slides}
             ${arrows}
             ${dots}
@@ -558,7 +559,7 @@ function renderProductsTable(){
     sec.products.forEach(p => {
       rows.push(`
         <tr>
-          <td>${(p.images && p.images[0]) ? `<img src="${p.images[0]}">` : ""}</td>
+          <td>${p.imageCount ? `<img src="/api/image/${p.id}/0">` : ""}</td>
           <td>${escapeHtml(p.name)}<div class="section-tag">${escapeHtml(sec.name)}</div></td>
           <td>${escapeHtml(p.price||"")}</td>
           <td class="row-actions">
@@ -606,7 +607,7 @@ function resetProductForm(){
   document.getElementById("cancelEditBtn").style.display = "none";
 }
 
-function editProduct(secId, prodId){
+async function editProduct(secId, prodId){
   const sec = STATE.sections.find(s=>s.id===secId);
   const p = sec.products.find(x=>x.id===prodId);
   if(!p) return;
@@ -617,11 +618,18 @@ function editProduct(secId, prodId){
   document.getElementById("pNotes").value = (p.notes||[]).join("\n");
   document.getElementById("dimLines").innerHTML = "";
   (p.dims && p.dims.length ? p.dims : [""]).forEach(d=>addDimLineInput(d));
-  pendingImages = (p.images && p.images.length) ? [...p.images] : [];
+  pendingImages = [];
   renderImagePreviews();
   document.getElementById("productFormTitle").textContent = "Editar producto";
   document.getElementById("cancelEditBtn").style.display = "inline-block";
   document.getElementById("productForm").scrollIntoView({behavior:"smooth", block:"center"});
+  // The public catalog doesn't carry the actual photo data (only a count),
+  // so fetch the full record — with photos — just for this edit form.
+  try{
+    const full = await apiCall("GET", "/api/admin/products/" + encodeURIComponent(prodId));
+    pendingImages = full.images || [];
+    renderImagePreviews();
+  }catch(e){ showToast("No se pudieron cargar las fotos actuales."); }
 }
 
 async function deleteProduct(secId, prodId){

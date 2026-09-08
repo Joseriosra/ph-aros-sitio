@@ -44,6 +44,13 @@ async function migrate() {
   `);
   // Add the new multi-image column if it doesn't exist yet (safe on repeated runs).
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]';`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS admin_edited BOOLEAN NOT NULL DEFAULT false;`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS meta (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    );
+  `);
 }
 
 async function seedIfEmpty() {
@@ -121,6 +128,36 @@ async function runFullSeed() {
   }
 }
 
+async function upgradeImageQualityOnce() {
+  const { rows } = await pool.query("SELECT value FROM meta WHERE key='images_quality_v2'");
+  if (rows.length) return; // already applied
+  console.log("Aplicando fotos en mejor calidad a los productos originales no editados...");
+  const seedPath = path.join(__dirname, "seed-data.json");
+  const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
+  const byId = {};
+  seed.forEach(sec => sec.products.forEach(p => { byId[p.id] = p.images || []; }));
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows: current } = await client.query("SELECT id FROM products WHERE admin_edited = false");
+    for (const row of current) {
+      const images = byId[row.id];
+      if (images && images.length) {
+        await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+      }
+    }
+    await client.query("INSERT INTO meta (key, value) VALUES ('images_quality_v2', 'done')");
+    await client.query("COMMIT");
+    console.log("Fotos en mejor calidad aplicadas.");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Error subiendo calidad de fotos:", e);
+  } finally {
+    client.release();
+  }
+}
+
 function requireAdmin(req, res, next) {
   const passcode = req.header("x-admin-passcode");
   if (passcode !== ADMIN_PASSCODE) {
@@ -150,14 +187,22 @@ async function rebuildCatalogCache() {
     material: s.material,
     products: prodRes.rows
       .filter(p => p.section_id === s.id)
-      .map(p => ({
-        id: p.id,
-        name: p.name,
-        price: p.price,
-        dims: p.dims,
-        notes: p.notes,
-        images: (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []),
-      })),
+      .map(p => {
+        const images = (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []);
+        return {
+          id: p.id,
+          name: p.name,
+          price: p.price,
+          dims: p.dims,
+          notes: p.notes,
+          // The public catalog only carries the PHOTO COUNT, not the photos
+          // themselves — each photo is fetched separately (and cached by the
+          // browser) via /api/image/:id/:idx. This is what lets the page
+          // render immediately instead of waiting for every photo of every
+          // product to download in one giant JSON response.
+          imageCount: images.length,
+        };
+      }),
   }));
   catalogCache = JSON.stringify({ sections });
   return catalogCache;
@@ -185,6 +230,50 @@ app.get("/api/catalog", async (req, res) => {
 app.post("/api/admin/verify", (req, res) => {
   const { passcode } = req.body || {};
   res.json({ ok: passcode === ADMIN_PASSCODE });
+});
+
+// Serves one photo of one product as an actual image response (not JSON),
+// so the browser can request, cache, and lazy-load each one independently.
+app.get("/api/image/:id/:idx", async (req, res) => {
+  try {
+    const idx = parseInt(req.params.idx, 10);
+    const { rows } = await pool.query("SELECT images, image FROM products WHERE id=$1", [req.params.id]);
+    if (!rows.length) return res.status(404).end();
+    const images = (rows[0].images && rows[0].images.length) ? rows[0].images : (rows[0].image ? [rows[0].image] : []);
+    const dataUrl = images[idx];
+    if (!dataUrl) return res.status(404).end();
+    const match = /^data:(image\/\w+);base64,(.+)$/.exec(dataUrl);
+    if (!match) return res.status(404).end();
+    const buffer = Buffer.from(match[2], "base64");
+    res.set("Content-Type", match[1]);
+    res.set("Cache-Control", "public, max-age=604800, immutable"); // 7 days
+    res.send(buffer);
+  } catch (e) {
+    console.error(e);
+    res.status(500).end();
+  }
+});
+
+// Admin-only: full product record including the raw photo data, used just
+// to populate the edit form (the public catalog never sends this much at once).
+app.get("/api/admin/products/:id", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM products WHERE id=$1", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: "No encontrado." });
+    const p = rows[0];
+    res.json({
+      id: p.id,
+      sectionId: p.section_id,
+      name: p.name,
+      price: p.price,
+      dims: p.dims,
+      notes: p.notes,
+      images: (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []),
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "No se pudo cargar el producto." });
+  }
 });
 
 // ---------- admin: sections ----------
@@ -252,7 +341,7 @@ app.patch("/api/admin/products/:id", requireAdmin, async (req, res) => {
     const { sectionId, name, price, dims, notes, images } = req.body || {};
     if (!sectionId || !name || !name.trim()) return res.status(400).json({ error: "Faltan datos del producto." });
     await pool.query(
-      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6 WHERE id=$7`,
+      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6, admin_edited=true WHERE id=$7`,
       [sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), req.params.id]
     );
     catalogCache = null;
@@ -284,6 +373,7 @@ async function start() {
     await migrate();
     await seedIfEmpty();
     await backfillImages();
+    await upgradeImageQualityOnce();
     await rebuildCatalogCache();
   } catch (e) {
     console.error("Error de inicialización de base de datos:", e);
