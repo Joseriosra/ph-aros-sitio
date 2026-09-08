@@ -139,6 +139,7 @@ function uid(prefix) {
 // re-serialize ~2MB of product photos on every page load (this was very
 // likely the cause of the free instance's 512MB memory-limit restarts).
 let catalogCache = null;
+let catalogCacheBuilding = null; // in-flight rebuild promise, shared by concurrent requests
 
 async function rebuildCatalogCache() {
   const secRes = await pool.query("SELECT * FROM sections ORDER BY position ASC");
@@ -164,7 +165,16 @@ async function rebuildCatalogCache() {
 
 app.get("/api/catalog", async (req, res) => {
   try {
-    const body = catalogCache || await rebuildCatalogCache();
+    if (catalogCache) {
+      res.type("application/json").send(catalogCache);
+      return;
+    }
+    // Only one in-flight rebuild at a time; concurrent requests share it
+    // instead of each triggering their own heavy query + JSON build.
+    if (!catalogCacheBuilding) {
+      catalogCacheBuilding = rebuildCatalogCache().finally(() => { catalogCacheBuilding = null; });
+    }
+    const body = await catalogCacheBuilding;
     res.type("application/json").send(body);
   } catch (e) {
     console.error(e);
