@@ -4,7 +4,7 @@ const path = require("path");
 const { Pool } = require("pg");
 
 const app = express();
-app.use(express.json({ limit: "15mb" }));
+app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE || "pauli2026";
@@ -40,12 +40,54 @@ async function migrate() {
       position INTEGER NOT NULL DEFAULT 0
     );
   `);
+  // Add the new multi-image column if it doesn't exist yet (safe on repeated runs).
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS images JSONB NOT NULL DEFAULT '[]';`);
 }
 
 async function seedIfEmpty() {
   const { rows } = await pool.query("SELECT COUNT(*)::int AS n FROM sections");
   if (rows[0].n > 0) return;
   console.log("Sembrando catálogo inicial...");
+  await runFullSeed();
+}
+
+// Backfill: for products that exist but still have an empty `images` array
+// (created before the carousel feature), pull the multi-photo set from
+// seed-data.json by matching product id, without touching anything an
+// admin may have already edited (those already have images set).
+async function backfillImages() {
+  const seedPath = path.join(__dirname, "seed-data.json");
+  const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
+  const byId = {};
+  seed.forEach(sec => sec.products.forEach(p => { byId[p.id] = p.images || []; }));
+
+  const { rows } = await pool.query(
+    "SELECT id, image, images FROM products WHERE images = '[]'::jsonb OR images IS NULL"
+  );
+  if (!rows.length) return;
+  console.log(`Actualizando ${rows.length} producto(s) con el set completo de fotos...`);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const row of rows) {
+      let images = byId[row.id];
+      if (!images || !images.length) {
+        // Fallback: keep whatever single photo it already had.
+        images = row.image ? [row.image] : [];
+      }
+      await client.query("UPDATE products SET images=$1 WHERE id=$2", [JSON.stringify(images), row.id]);
+    }
+    await client.query("COMMIT");
+    console.log("Fotos actualizadas.");
+  } catch (e) {
+    await client.query("ROLLBACK");
+    console.error("Error actualizando fotos:", e);
+  } finally {
+    client.release();
+  }
+}
+
+async function runFullSeed() {
   const seedPath = path.join(__dirname, "seed-data.json");
   const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
   const client = await pool.connect();
@@ -59,10 +101,11 @@ async function seedIfEmpty() {
       );
       for (let pi = 0; pi < sec.products.length; pi++) {
         const p = sec.products[pi];
+        const images = p.images || (p.image ? [p.image] : []);
         await client.query(
-          `INSERT INTO products (id, section_id, name, price, dims, notes, image, position)
+          `INSERT INTO products (id, section_id, name, price, dims, notes, images, position)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [p.id, sec.id, p.name, p.price || "", JSON.stringify(p.dims || []), JSON.stringify(p.notes || []), p.image || null, pi]
+          [p.id, sec.id, p.name, p.price || "", JSON.stringify(p.dims || []), JSON.stringify(p.notes || []), JSON.stringify(images), pi]
         );
       }
     }
@@ -105,7 +148,7 @@ app.get("/api/catalog", async (req, res) => {
           price: p.price,
           dims: p.dims,
           notes: p.notes,
-          image: p.image,
+          images: (p.images && p.images.length) ? p.images : (p.image ? [p.image] : []),
         })),
     }));
     res.json({ sections });
@@ -160,14 +203,14 @@ app.delete("/api/admin/sections/:id", requireAdmin, async (req, res) => {
 // ---------- admin: products ----------
 app.post("/api/admin/products", requireAdmin, async (req, res) => {
   try {
-    const { sectionId, name, price, dims, notes, image } = req.body || {};
+    const { sectionId, name, price, dims, notes, images } = req.body || {};
     if (!sectionId || !name || !name.trim()) return res.status(400).json({ error: "Faltan datos del producto." });
     const id = uid("p");
     const { rows } = await pool.query("SELECT COALESCE(MAX(position),-1)+1 AS pos FROM products WHERE section_id=$1", [sectionId]);
     await pool.query(
-      `INSERT INTO products (id, section_id, name, price, dims, notes, image, position)
+      `INSERT INTO products (id, section_id, name, price, dims, notes, images, position)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), image || null, rows[0].pos]
+      [id, sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), rows[0].pos]
     );
     res.json({ ok: true, id });
   } catch (e) {
@@ -178,11 +221,11 @@ app.post("/api/admin/products", requireAdmin, async (req, res) => {
 
 app.patch("/api/admin/products/:id", requireAdmin, async (req, res) => {
   try {
-    const { sectionId, name, price, dims, notes, image } = req.body || {};
+    const { sectionId, name, price, dims, notes, images } = req.body || {};
     if (!sectionId || !name || !name.trim()) return res.status(400).json({ error: "Faltan datos del producto." });
     await pool.query(
-      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, image=$6 WHERE id=$7`,
-      [sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), image || null, req.params.id]
+      `UPDATE products SET section_id=$1, name=$2, price=$3, dims=$4, notes=$5, images=$6 WHERE id=$7`,
+      [sectionId, name.trim(), price || "", JSON.stringify(dims || []), JSON.stringify(notes || []), JSON.stringify(images || []), req.params.id]
     );
     res.json({ ok: true });
   } catch (e) {
@@ -210,6 +253,7 @@ async function start() {
   try {
     await migrate();
     await seedIfEmpty();
+    await backfillImages();
   } catch (e) {
     console.error("Error de inicialización de base de datos:", e);
   }

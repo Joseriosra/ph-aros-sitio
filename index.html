@@ -111,9 +111,21 @@
   .card:hover{box-shadow:0 20px 34px -22px rgba(20,27,44,.4); transform:translateY(-2px);}
   .card .thumb{
     aspect-ratio:1/1; background:#F3EEE3; display:flex; align-items:center; justify-content:center; overflow:hidden;
+    position:relative;
   }
   .card .thumb img{width:100%; height:100%; object-fit:cover;}
   .card .thumb.empty{color:var(--muted); font-size:12.5px; letter-spacing:1px;}
+  .carousel-arrow{
+    position:absolute; top:50%; transform:translateY(-50%); background:rgba(20,27,44,.55); color:#fff; border:none;
+    width:28px; height:28px; border-radius:50%; font-size:17px; line-height:1; cursor:pointer; opacity:0; transition:opacity .15s ease;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .card:hover .carousel-arrow{opacity:1;}
+  .carousel-arrow.prev{left:8px;}
+  .carousel-arrow.next{right:8px;}
+  .carousel-dots{position:absolute; bottom:8px; left:0; right:0; display:flex; justify-content:center; gap:5px;}
+  .carousel-dots .dot{width:5px; height:5px; border-radius:50%; background:rgba(255,255,255,.6); border:1px solid rgba(20,27,44,.3); cursor:pointer;}
+  .carousel-dots .dot.active{background:var(--navy);}
   .card-body{padding:18px 18px 20px; display:flex; flex-direction:column; gap:8px; flex:1;}
   .card-body h4{margin:0; font-size:17px; color:var(--navy); font-weight:600; font-family:'Fraunces',serif;}
   .card-dims{font-size:12.5px; color:var(--muted); line-height:1.6;}
@@ -326,10 +338,10 @@
               <label>Precio (ej: $34.990)</label>
               <input type="text" id="pPrice">
             </div>
-            <div class="field">
-              <label>Foto</label>
-              <input type="file" id="pImage" accept="image/*">
-              <img id="pImagePreview" class="thumb-preview" style="display:none;">
+            <div class="field full">
+              <label>Fotos (puedes elegir varias — se muestran como carrusel)</label>
+              <input type="file" id="pImage" accept="image/*" multiple>
+              <div id="pImagePreviewList" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;"></div>
             </div>
           </div>
           <div class="field full">
@@ -431,10 +443,22 @@ function renderCatalog(){
       const dims = (p.dims||[]).map(d=>`<div>${escapeHtml(d)}</div>`).join("");
       const notes = (p.notes||[]).map(n=>`<div style="font-style:italic;">${escapeHtml(n)}</div>`).join("");
       const askText = `Hola! Me interesa "${p.name}"${p.price ? " ("+p.price+")" : ""}. ¿Está disponible?`;
+      const images = p.images && p.images.length ? p.images : [];
+      const slides = images.length
+        ? images.map((src,i)=>`<img src="${src}" alt="${escapeHtml(p.name)}" loading="lazy" class="carousel-slide" data-idx="${i}" style="display:${i===0?"block":"none"};">`).join("")
+        : `<div class="thumb empty" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;">Sin foto</div>`;
+      const dots = images.length > 1
+        ? `<div class="carousel-dots">${images.map((_,i)=>`<span class="dot ${i===0?"active":""}" data-idx="${i}"></span>`).join("")}</div>`
+        : "";
+      const arrows = images.length > 1
+        ? `<button type="button" class="carousel-arrow prev" aria-label="Anterior">‹</button><button type="button" class="carousel-arrow next" aria-label="Siguiente">›</button>`
+        : "";
       return `
         <div class="card">
-          <div class="thumb ${p.image ? "" : "empty"}">
-            ${p.image ? `<img src="${p.image}" alt="${escapeHtml(p.name)}" loading="lazy">` : "Sin foto"}
+          <div class="thumb carousel" data-index="0" data-count="${images.length}">
+            ${slides}
+            ${arrows}
+            ${dots}
           </div>
           <div class="card-body">
             <h4>${escapeHtml(p.name)}</h4>
@@ -468,6 +492,30 @@ function renderSite(){
   renderCollectionsStrip();
   renderCatalog();
 }
+
+function showCarouselSlide(carouselEl, idx){
+  const slides = carouselEl.querySelectorAll(".carousel-slide");
+  const dots = carouselEl.querySelectorAll(".dot");
+  const count = slides.length;
+  if(!count) return;
+  const wrapped = ((idx % count) + count) % count;
+  slides.forEach(s => s.style.display = (Number(s.dataset.idx) === wrapped) ? "block" : "none");
+  dots.forEach(d => d.classList.toggle("active", Number(d.dataset.idx) === wrapped));
+  carouselEl.dataset.index = String(wrapped);
+}
+
+document.addEventListener("click", (e)=>{
+  const carouselEl = e.target.closest(".carousel");
+  if(!carouselEl) return;
+  const current = Number(carouselEl.dataset.index || 0);
+  if(e.target.closest(".carousel-arrow.next")){
+    showCarouselSlide(carouselEl, current + 1);
+  } else if(e.target.closest(".carousel-arrow.prev")){
+    showCarouselSlide(carouselEl, current - 1);
+  } else if(e.target.classList.contains("dot")){
+    showCarouselSlide(carouselEl, Number(e.target.dataset.idx));
+  }
+});
 
 /* ---------------- ADMIN ---------------- */
 function isAdminUnlocked(){
@@ -510,7 +558,7 @@ function renderProductsTable(){
     sec.products.forEach(p => {
       rows.push(`
         <tr>
-          <td>${p.image ? `<img src="${p.image}">` : ""}</td>
+          <td>${(p.images && p.images[0]) ? `<img src="${p.images[0]}">` : ""}</td>
           <td>${escapeHtml(p.name)}<div class="section-tag">${escapeHtml(sec.name)}</div></td>
           <td>${escapeHtml(p.price||"")}</td>
           <td class="row-actions">
@@ -531,15 +579,29 @@ function addDimLineInput(value){
   wrap.appendChild(row);
 }
 
-let pendingImageB64 = null;
+let pendingImages = [];
+
+function renderImagePreviews(){
+  const wrap = document.getElementById("pImagePreviewList");
+  wrap.innerHTML = pendingImages.map((src, i) => `
+    <div style="position:relative;">
+      <img src="${src}" class="thumb-preview" style="margin-top:0;">
+      <button type="button" class="small-btn danger" style="position:absolute; top:-8px; right:-8px; padding:2px 6px; border-radius:50%;" onclick="removePendingImage(${i})">✕</button>
+    </div>
+  `).join("");
+}
+function removePendingImage(i){
+  pendingImages.splice(i,1);
+  renderImagePreviews();
+}
 
 function resetProductForm(){
   document.getElementById("editingProductId").value = "";
   document.getElementById("productForm").reset();
   document.getElementById("dimLines").innerHTML = "";
   addDimLineInput("");
-  document.getElementById("pImagePreview").style.display = "none";
-  pendingImageB64 = null;
+  pendingImages = [];
+  renderImagePreviews();
   document.getElementById("productFormTitle").textContent = "Agregar producto";
   document.getElementById("cancelEditBtn").style.display = "none";
 }
@@ -555,9 +617,8 @@ function editProduct(secId, prodId){
   document.getElementById("pNotes").value = (p.notes||[]).join("\n");
   document.getElementById("dimLines").innerHTML = "";
   (p.dims && p.dims.length ? p.dims : [""]).forEach(d=>addDimLineInput(d));
-  pendingImageB64 = p.image || null;
-  const prev = document.getElementById("pImagePreview");
-  if(p.image){ prev.src = p.image; prev.style.display = "block"; } else { prev.style.display = "none"; }
+  pendingImages = (p.images && p.images.length) ? [...p.images] : [];
+  renderImagePreviews();
   document.getElementById("productFormTitle").textContent = "Editar producto";
   document.getElementById("cancelEditBtn").style.display = "inline-block";
   document.getElementById("productForm").scrollIntoView({behavior:"smooth", block:"center"});
@@ -656,16 +717,21 @@ function initAdminEvents(){
   document.getElementById("filterSection").addEventListener("change", renderProductsTable);
 
   document.getElementById("pImage").addEventListener("change", (e)=>{
-    const file = e.target.files[0];
-    if(!file) return;
-    const reader = new FileReader();
-    reader.onload = ()=>{
-      pendingImageB64 = reader.result;
-      const prev = document.getElementById("pImagePreview");
-      prev.src = pendingImageB64;
-      prev.style.display = "block";
-    };
-    reader.readAsDataURL(file);
+    const files = Array.from(e.target.files || []);
+    if(!files.length) return;
+    let pending = files.length;
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = ()=>{
+        pendingImages.push(reader.result);
+        pending--;
+        if(pending === 0){
+          renderImagePreviews();
+          e.target.value = "";
+        }
+      };
+      reader.readAsDataURL(file);
+    });
   });
 
   document.getElementById("productForm").addEventListener("submit", async (e)=>{
@@ -681,7 +747,7 @@ function initAdminEvents(){
       name: document.getElementById("pName").value.trim(),
       price: document.getElementById("pPrice").value.trim(),
       dims, notes,
-      image: pendingImageB64
+      images: pendingImages
     };
     if(!productData.name){ showToast("Falta el nombre del producto."); return; }
 
